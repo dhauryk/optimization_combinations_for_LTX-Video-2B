@@ -1,0 +1,92 @@
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "optimization-experiment"
+version = "0.1.0"
+description = "Comparative analysis of neural network optimization methods on image-to-video diffusion (SVD/LCM)"
+authors = ["You <you@example.com>"]
+readme = "README.md"
+package-mode = false
+packages = [{ include = "i2v_opt" }]
+
+# PyTorch CUDA 12.8 wheels
+[[tool.poetry.source]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+priority = "explicit"
+
+# NVIDIA Python packages (cusparselt lives here)
+[[tool.poetry.source]]
+name = "nvidia-pypi"
+url = "https://pypi.ngc.nvidia.com"
+priority = "supplemental"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+
+# --- PyTorch + CUDA 12.8 ---
+torch = { version = "2.9.1+cu128", source = "pytorch-cu128" }
+torchvision = { version = "0.24.1+cu128", source = "pytorch-cu128" }
+torchaudio = { version = "2.9.1+cu128", source = "pytorch-cu128" }
+
+# --- Performance / optimization experiments ---
+# IMPORTANT: take the cu128 build, not a generic PyPI one
+torchao = { version = "0.15.0+cu128", source = "pytorch-cu128" }
+
+# IMPORTANT: must match torch wheel requirement (avoid 0.8.x conflicts)
+nvidia-cusparselt-cu12 = { version = "0.7.1", markers = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+
+# --- Core: diffusion / video ---
+diffusers = "^0.36.0"
+transformers = "^4.57.3"
+accelerate = "^1.12.0"
+safetensors = "^0.4.5"
+huggingface-hub = ">=0.34.0,<1.0"
+sentencepiece = ">=0.2.0,<0.3.0"
+protobuf = ">=4.25.0,<6.0.0"
+
+
+# --- IO / utils ---
+numpy = "^2.0.0"
+scipy = "^1.12.0"
+pillow = "^10.0.0"
+tqdm = "^4.66.0"
+einops = "^0.8.0"
+packaging = "^24.0"
+piq = "^0.8.0"
+pynvml = "^11.5.0"
+
+# --- Video writing ---
+imageio = "^2.34.0"
+imageio-ffmpeg = "^0.5.1"
+opencv-python = "^4.10.0.84"
+
+# --- Metrics ---
+scikit-image = "^0.24.0"
+lpips = "^0.1.4"
+open-clip-torch = "^3.2.0"
+
+# --- Frame interpolation (method 6) ---
+ccvfi = "^0.0.3"
+
+# --- Notebook runtime ---
+ipykernel = "^6.29.0"
+ipywidgets = "^8.1.0"
+matplotlib = "^3.9.0"
+pandas = "^2.2.0"
+nvidia-ml-py = "^13.590.44"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.8.0"
+black = "^24.10.0"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
