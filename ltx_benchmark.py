@@ -379,6 +379,21 @@ class GpuTempMonitor:
             time.sleep(self.interval_s)
 
 
+def collect_cuda_stage_metrics(prefix: str, total_mb: float, temp_peak: Optional[int]) -> Dict[str, Any]:
+    """Collect prefixed CUDA memory and temperature metrics for one benchmark stage."""
+    peak_alloc_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    peak_reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
+    end_alloc_mb = torch.cuda.memory_allocated() / (1024 ** 2)
+
+    return {
+        f"{prefix} Peak VRAM alloc (MB)": round(peak_alloc_mb, 1),
+        f"{prefix} Peak alloc (% total)": round(100.0 * peak_alloc_mb / total_mb, 2),
+        f"{prefix} Peak VRAM reserved (MB)": round(peak_reserved_mb, 1),
+        f"{prefix} VRAM end alloc (MB)": round(end_alloc_mb, 1),
+        f"{prefix} GPU temp peak (C)": temp_peak,
+    }
+
+
 
 # Optional metrics
 
@@ -1015,33 +1030,60 @@ def run_worker(args: argparse.Namespace) -> int:
         pipe = load_ltx_pipeline(args, combo)
         clear_cuda()
 
-        prompt_conditioning_kwargs, text_encoder_record = precompute_prompt_conditioning(
-            pipe=pipe,
-            args=args,
-            combo=combo,
-            dtype=get_torch_dtype(args.dtype),
-        )
-        record.update(text_encoder_record)
+        total_mb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+
+        text_seconds: Optional[float] = None
+        text_temp_peak: Optional[int] = None
+        torch.cuda.reset_peak_memory_stats()
+
+        if args.text_encoder_mode != "original":
+            text_monitor = GpuTempMonitor(interval_s=args.temp_poll_interval)
+            text_monitor.start()
+            text_t0 = time.perf_counter()
+            try:
+                prompt_conditioning_kwargs, text_encoder_record = precompute_prompt_conditioning(
+                    pipe=pipe,
+                    args=args,
+                    combo=combo,
+                    dtype=get_torch_dtype(args.dtype),
+                )
+                torch.cuda.synchronize()
+                text_seconds = time.perf_counter() - text_t0
+            finally:
+                text_temp_peak = text_monitor.stop()
+
+            record.update(text_encoder_record)
+            record.update({"Text Seconds": round(text_seconds, 4)})
+            record.update(collect_cuda_stage_metrics("Text", total_mb, text_temp_peak))
+        else:
+            prompt_conditioning_kwargs, text_encoder_record = precompute_prompt_conditioning(
+                pipe=pipe,
+                args=args,
+                combo=combo,
+                dtype=get_torch_dtype(args.dtype),
+            )
+            record.update(text_encoder_record)
 
         torch.cuda.reset_peak_memory_stats()
-        monitor = GpuTempMonitor(interval_s=args.temp_poll_interval)
-        monitor.start()
+        diffusion_monitor = GpuTempMonitor(interval_s=args.temp_poll_interval)
+        diffusion_monitor.start()
 
-        t0 = time.perf_counter()
-        frames = call_pipeline(
-            pipe,
-            args,
-            combo,
-            steps=steps,
-            gen_w=gen_w,
-            gen_h=gen_h,
-            gen_frames=gen_frames,
-            prompt_conditioning_kwargs=prompt_conditioning_kwargs,
-        )
-        torch.cuda.synchronize()
-        seconds = time.perf_counter() - t0
-
-        temp_peak = monitor.stop()
+        diffusion_t0 = time.perf_counter()
+        try:
+            frames = call_pipeline(
+                pipe,
+                args,
+                combo,
+                steps=steps,
+                gen_w=gen_w,
+                gen_h=gen_h,
+                gen_frames=gen_frames,
+                prompt_conditioning_kwargs=prompt_conditioning_kwargs,
+            )
+            torch.cuda.synchronize()
+            diffusion_seconds = time.perf_counter() - diffusion_t0
+        finally:
+            diffusion_temp_peak = diffusion_monitor.stop()
 
         frames = ensure_exact_frame_count(frames, gen_frames)
         if combo.temporal_subsample:
@@ -1057,10 +1099,7 @@ def run_worker(args: argparse.Namespace) -> int:
 
         export_to_video(frames, str(video_path), fps=args.fps)
 
-        peak_alloc_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
-        peak_reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
-        end_alloc_mb = torch.cuda.memory_allocated() / (1024 ** 2)
-        total_mb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+        total_seconds = diffusion_seconds + (text_seconds or 0.0)
 
         tssim = compute_temporal_ssim(frames)
         tlpips = compute_temporal_lpips(frames)
@@ -1068,20 +1107,19 @@ def run_worker(args: argparse.Namespace) -> int:
 
         record.update(
             {
-                "Seconds": round(seconds, 4),
-                "s/frame": round(seconds / max(1, len(frames)), 4),
+                "Diffusion Seconds": round(diffusion_seconds, 4),
+                "Text Seconds": None if text_seconds is None else round(text_seconds, 4),
+                "Total Seconds": round(total_seconds, 4),
+                "Diffusion s/frame": round(diffusion_seconds / max(1, len(frames)), 4),
+                "Total s/frame": round(total_seconds / max(1, len(frames)), 4),
                 "CLIP sim": None if clip_sim is None else round(float(clip_sim), 6),
                 "tSSIM": None if tssim is None else round(float(tssim), 6),
                 "tLPIPS": None if tlpips is None else round(float(tlpips), 6),
-                "Peak VRAM alloc (MB)": round(peak_alloc_mb, 1),
-                "Peak alloc (% total)": round(100.0 * peak_alloc_mb / total_mb, 2),
-                "Peak VRAM reserved (MB)": round(peak_reserved_mb, 1),
-                "VRAM end alloc (MB)": round(end_alloc_mb, 1),
-                "GPU temp peak (C)": temp_peak,
                 "Status": "ok",
                 "Error": "",
             }
         )
+        record.update(collect_cuda_stage_metrics("Diffusion", total_mb, diffusion_temp_peak))
         return_code = 0
 
     except Exception as exc:
@@ -1195,10 +1233,51 @@ def build_combos(args: argparse.Namespace) -> List[Combo]:
     return combos
 
 
+def _float_or_none(value: Any) -> Optional[float]:
+    """Convert a table value to float when possible."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_result_record_columns(row: Dict[str, Any]) -> None:
+    """Populate the new prefixed metric columns for older per-run JSON files."""
+    legacy_to_diffusion = {
+        "Seconds": "Diffusion Seconds",
+        "s/frame": "Diffusion s/frame",
+        "Peak VRAM alloc (MB)": "Diffusion Peak VRAM alloc (MB)",
+        "Peak alloc (% total)": "Diffusion Peak alloc (% total)",
+        "Peak VRAM reserved (MB)": "Diffusion Peak VRAM reserved (MB)",
+        "VRAM end alloc (MB)": "Diffusion VRAM end alloc (MB)",
+        "GPU temp peak (C)": "Diffusion GPU temp peak (C)",
+    }
+    for old_name, new_name in legacy_to_diffusion.items():
+        if new_name not in row and old_name in row:
+            row[new_name] = row[old_name]
+
+    text_seconds = _float_or_none(row.get("Text Seconds"))
+    diffusion_seconds = _float_or_none(row.get("Diffusion Seconds"))
+
+    if row.get("Total Seconds") is None and diffusion_seconds is not None:
+        row["Total Seconds"] = round(diffusion_seconds + (text_seconds or 0.0), 4)
+
+    total_seconds = _float_or_none(row.get("Total Seconds"))
+    output_frames = _float_or_none(row.get("Output frames") or row.get("Frames"))
+
+    if row.get("Total s/frame") is None and total_seconds is not None and output_frames:
+        row["Total s/frame"] = round(total_seconds / max(1.0, output_frames), 4)
+
+
 def write_tables(run_dir: Path, records: List[Dict[str, Any]]) -> None:
     """Save CSV, Markdown and optional XLSX results tables."""
     if not records:
         return
+
+    for row in records:
+        normalize_result_record_columns(row)
 
     # Compute speedup after all rows are available. Baseline is the first successful no-optimization row.
     baseline_seconds: Optional[float] = None
@@ -1214,12 +1293,13 @@ def write_tables(run_dir: Path, records: List[Dict[str, Any]]) -> None:
             and row.get("Lowres") is False
             and row.get("Temporal subsample") is False
             and row.get("Text encoder mode") in {None, "original"}
+            and row.get("Total Seconds") is not None
         ):
-            baseline_seconds = float(row["Seconds"])
+            baseline_seconds = float(row["Total Seconds"])
             break
 
     for row in records:
-        seconds = row.get("Seconds")
+        seconds = row.get("Total Seconds")
         if baseline_seconds and seconds and row.get("Status") == "ok":
             row["Speedup vs baseline"] = f"{baseline_seconds / float(seconds):.2f}x"
         else:
@@ -1245,17 +1325,25 @@ def write_tables(run_dir: Path, records: List[Dict[str, Any]]) -> None:
         "Generated height",
         "Output width",
         "Output height",
-        "Seconds",
+        "Text Seconds",
+        "Diffusion Seconds",
+        "Total Seconds",
         "Speedup vs baseline",
-        "s/frame",
+        "Diffusion s/frame",
+        "Total s/frame",
         "CLIP sim",
         "tSSIM",
         "tLPIPS",
-        "Peak VRAM alloc (MB)",
-        "Peak alloc (% total)",
-        "Peak VRAM reserved (MB)",
-        "VRAM end alloc (MB)",
-        "GPU temp peak (C)",
+        "Text Peak VRAM alloc (MB)",
+        "Text Peak alloc (% total)",
+        "Text Peak VRAM reserved (MB)",
+        "Text VRAM end alloc (MB)",
+        "Text GPU temp peak (C)",
+        "Diffusion Peak VRAM alloc (MB)",
+        "Diffusion Peak alloc (% total)",
+        "Diffusion Peak VRAM reserved (MB)",
+        "Diffusion VRAM end alloc (MB)",
+        "Diffusion GPU temp peak (C)",
         "Status",
         "Error",
         "Output video",
