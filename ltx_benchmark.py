@@ -31,7 +31,7 @@ from PIL import Image
 class Combo:
     """One optimization combination to run."""
 
-    text_encoder: str           # original | precompute | none_zero
+    text_encoder: str           # original | precompute | saved_embeds
     checkpoint: str             # base | distilled | distilled_fp8
     quant: str                  # none | fp8 | int8
     compile: bool               # torch.compile + TF32
@@ -64,8 +64,8 @@ class Combo:
             parts.append("original T5 text encoder")
         elif self.text_encoder == "precompute":
             parts.append("precomputed original T5 embeds + unload T5")
-        elif self.text_encoder == "none_zero":
-            parts.append("no-text zero embeds + unload text encoder")
+        elif self.text_encoder == "saved_embeds":
+            parts.append("saved portrait prompt embeds + unload text encoder")
 
         if self.checkpoint == "base":
             parts.append("base checkpoint")
@@ -159,11 +159,11 @@ def normalize_text_encoder_mode(value: str) -> str:
         "default": "original",
         "precompute": "precompute",
         "precomputed": "precompute",
-        "none_zero": "none_zero",
-        "no_text": "none_zero",
-        "notext": "none_zero",
-        "zero": "none_zero",
-        "unconditional": "none_zero",
+
+        "saved_embeds": "saved_embeds",
+        "saved": "saved_embeds",
+        "cached_embeds": "saved_embeds",
+        "portrait_embeds": "saved_embeds",
     }
     if value not in aliases:
         raise argparse.ArgumentTypeError(f"Unsupported text encoder mode: {value}")
@@ -593,27 +593,6 @@ def get_guidance_values(args: argparse.Namespace, combo: Combo) -> Tuple[float, 
     return float(guidance_scale), guidance_rescale
 
 
-def get_text_conditioning_dim(pipe: Any) -> int:
-    """Best-effort target dimension for LTX text conditioning embeddings."""
-    text_encoder = getattr(pipe, "text_encoder", None)
-    config = getattr(text_encoder, "config", None)
-    for name in ("d_model", "hidden_size"):
-        value = getattr(config, name, None)
-        if value is not None:
-            return int(value)
-
-    transformer_config = getattr(getattr(pipe, "transformer", None), "config", None)
-    for name in ("caption_channels", "cross_attention_dim", "encoder_hidden_size"):
-        value = getattr(transformer_config, name, None)
-        if value is not None:
-            return int(value)
-
-    raise RuntimeError(
-        "Could not infer text conditioning dimension. Keep --text-encoder-mode original/precompute "
-        "or check the LTX transformer config manually."
-    )
-
-
 def unload_text_encoder(pipe: Any) -> None:
     """Remove text encoder/tokenizer/projection modules after prompt embeds are precomputed."""
     for attr in ("text_encoder", "tokenizer", "text_projection"):
@@ -631,28 +610,26 @@ def unload_text_encoder(pipe: Any) -> None:
         torch.cuda.ipc_collect()
 
 
-def make_zero_text_conditioning(
+def load_saved_prompt_conditioning(
     pipe: Any,
     args: argparse.Namespace,
     combo: Combo,
     dtype: torch.dtype,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Create neutral zero text-conditioning tensors and unload the text encoder.
+    """Load precomputed positive/negative prompt embeddings from disk and unload text encoder."""
+    if not args.saved_prompt_embeds:
+        raise RuntimeError(
+            "--saved-prompt-embeds is required when text encoder mode is saved_embeds"
+        )
 
-    This is an experimental no-prompt mode for benchmarking and student-model
-    experiments. It bypasses text encoding by feeding zero prompt embeddings
-    directly to the pipeline. The pretrained LTX transformer was trained with
-    text conditioning, so quality and controllability are expected to degrade.
-    """
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     guidance_scale, _ = get_guidance_values(args, combo)
     do_cfg = guidance_scale > 1.0
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    target_dim = get_text_conditioning_dim(pipe)
-    seq_len = max(1, int(args.no_text_sequence_length))
 
-    prompt_embeds = torch.zeros((1, seq_len, target_dim), device=device, dtype=dtype)
-    # Use a valid token mask instead of an all-false mask to avoid attention edge cases.
-    prompt_attention_mask = torch.ones((1, seq_len), device=device, dtype=torch.bool)
+    data = torch.load(args.saved_prompt_embeds, map_location="cpu")
+
+    prompt_embeds = data["prompt_embeds"].to(device=device, dtype=dtype)
+    prompt_attention_mask = data["prompt_attention_mask"].to(device=device)
 
     prompt_kwargs: Dict[str, Any] = {
         "prompt": None,
@@ -660,9 +637,10 @@ def make_zero_text_conditioning(
         "prompt_embeds": prompt_embeds,
         "prompt_attention_mask": prompt_attention_mask,
     }
+
     if do_cfg:
-        prompt_kwargs["negative_prompt_embeds"] = torch.zeros_like(prompt_embeds)
-        prompt_kwargs["negative_prompt_attention_mask"] = torch.ones_like(prompt_attention_mask)
+        prompt_kwargs["negative_prompt_embeds"] = data["negative_prompt_embeds"].to(device=device, dtype=dtype)
+        prompt_kwargs["negative_prompt_attention_mask"] = data["negative_prompt_attention_mask"].to(device=device)
 
     text_info = {
         "Text encoder mode": args.text_encoder_mode,
@@ -670,11 +648,12 @@ def make_zero_text_conditioning(
         "Text encoder unloaded": True,
         "Prompt embed dim": int(prompt_embeds.shape[-1]),
         "Prompt tokens": int(prompt_embeds.shape[1]),
-        "No text conditioning": True,
+        "No text conditioning": False,
+        "Saved prompt embeds": str(args.saved_prompt_embeds),
     }
+
     unload_text_encoder(pipe)
     return prompt_kwargs, text_info
-
 
 def precompute_prompt_conditioning(
     pipe: Any,
@@ -683,8 +662,8 @@ def precompute_prompt_conditioning(
     dtype: torch.dtype,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Precompute prompt embeddings and optionally unload the text encoder before denoising."""
-    if args.text_encoder_mode == "none_zero":
-        return make_zero_text_conditioning(pipe, args, combo, dtype)
+    if args.text_encoder_mode == "saved_embeds":
+        return load_saved_prompt_conditioning(pipe, args, combo, dtype)
 
     if args.text_encoder_mode != "precompute":
         return {}, {
@@ -995,9 +974,8 @@ def run_worker(args: argparse.Namespace) -> int:
         "Text encoder mode": args.text_encoder_mode,
         "Prompt embeds precomputed": False,
         "Text encoder unloaded": False,
-        "No text conditioning": args.text_encoder_mode == "none_zero",
+        "No text conditioning": False,
         "Max sequence length": args.max_sequence_length,
-        "No text sequence length": args.no_text_sequence_length,
         "Model": args.model_id if not args.single_file else args.single_file,
         "Output video": str(video_path),
         "Status": "failed",
@@ -1103,7 +1081,7 @@ def run_worker(args: argparse.Namespace) -> int:
 
         tssim = compute_temporal_ssim(frames)
         tlpips = compute_temporal_lpips(frames)
-        clip_sim = None if args.text_encoder_mode == "none_zero" else compute_clip_text_image_similarity(frames, args.prompt)
+        clip_sim = compute_clip_text_image_similarity(frames, args.prompt)
 
         record.update(
             {
@@ -1439,12 +1417,12 @@ def args_to_worker_cli(args: argparse.Namespace) -> List[str]:
         args.text_encoder_mode,
         "--max-sequence-length",
         str(args.max_sequence_length),
-        "--no-text-sequence-length",
-        str(args.no_text_sequence_length),
         "--prompt",
         args.prompt,
         "--negative-prompt",
         args.negative_prompt,
+        "--saved-prompt-embeds",
+        args.saved_prompt_embeds,
         "--width",
         str(args.width),
         "--height",
@@ -1567,7 +1545,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--text-encoder-mode",
         default="original",
-        choices=["original", "precompute", "none_zero"],
+        choices=["original", "precompute", "saved_embeds"],
         help=(
             "Single text conditioning mode used by worker subprocesses and for backward compatibility. "
             "For full benchmarks use --text-encoder-modes."
@@ -1576,14 +1554,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--text-encoder-modes",
         nargs="+",
-        default=["original", "precompute", "none_zero"],
-        choices=["original", "precompute", "none_zero"],
+        default=["original", "precompute", "saved_embeds"],
+        choices=["original", "precompute", "saved_embeds"],
         help=(
-            "Text-conditioning grid axis. 'precompute' encodes prompt_embeds once and unloads T5 before denoising. "
-            "'none_zero' bypasses prompt/text encoding by feeding zero prompt_embeds and unloading the text encoder."
+            "Text-conditioning grid axis. 'precompute' encodes prompt_embeds once per worker and unloads T5. "
+            "'saved_embeds' loads precomputed portrait prompt embeddings from disk and unloads the text encoder."
         ),
     )
-    parser.add_argument("--no-text-sequence-length", type=int, default=1, help="Sequence length for --text-encoder-mode none_zero zero prompt embeddings.")
 
     # Generation settings.
     parser.add_argument(
@@ -1637,8 +1614,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--decode-timestep", type=float, default=0.05)
     parser.add_argument("--decode-noise-scale", type=float, default=0.025)
-    parser.add_argument("--guidance-scale", type=float, default=1.0, help="Use 1.0 for guidance-distilled LTX variants; increase for non-distilled models.")
-    parser.add_argument("--distilled-guidance-scale", type=float, default=1.0, help="Guidance scale used for distilled checkpoints.")
+    parser.add_argument("--guidance-scale", type=float, default=3.0)
+    parser.add_argument("--distilled-guidance-scale", type=float, default=3.0)
     parser.add_argument("--distilled-guidance-rescale", type=float, default=0.7, help="Guidance rescale used for distilled checkpoints; use none by passing a negative value.")
     parser.add_argument("--tone-map-compression-ratio", type=float, default=0.6, help="Optional LTX 0.9.8 distilled tone mapping parameter, filtered out if unsupported.")
     parser.add_argument("--pass-frame-rate", action="store_true", help="Pass frame_rate=fps to pipelines that support it.")
@@ -1666,6 +1643,11 @@ def parse_args() -> argparse.Namespace:
     # Metrics.
     parser.add_argument("--temp-poll-interval", type=float, default=0.5)
     parser.add_argument("--disable-progress-bar", action="store_true")
+    parser.add_argument(
+        "--saved-prompt-embeds",
+        default="portrait_prompt_embeds.pt",
+        help="Path to torch .pt file with saved prompt_embeds, negative_prompt_embeds and attention masks.",
+    )
 
     args = parser.parse_args()
 
