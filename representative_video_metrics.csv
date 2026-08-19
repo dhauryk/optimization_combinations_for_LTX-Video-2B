@@ -1,0 +1,12 @@
+frames,fps,w,h,size_kb,motion_abs,motion_p95,total_change,sharpness,brightness,contrast,label,file
+50,25.0,512,512,174.4,4.285,7.195,30.802,211.6,135.2,51.2,baseline base 25 steps,text-original__ckpt-base__q-none__compile-0__offload-none__vae-tiling-0__fast-steps-0__lowres-0__temporal-sub-0.mp4
+50,25.0,512,512,176.1,3.275,4.205,22.855,200.7,137.0,47.9,base fast 8 steps,text-original__ckpt-base__q-none__compile-0__offload-none__vae-tiling-0__fast-steps-1__lowres-0__temporal-sub-0.mp4
+50,25.0,512,512,175.5,4.378,7.09,31.92,225.0,135.0,51.1,base FP8 layerwise,text-original__ckpt-base__q-fp8__compile-0__offload-none__vae-tiling-0__fast-steps-0__lowres-0__temporal-sub-0.mp4
+50,25.0,512,512,174.1,4.438,7.229,31.443,226.6,134.8,51.3,base INT8 weight-only,text-original__ckpt-base__q-int8__compile-0__offload-none__vae-tiling-0__fast-steps-0__lowres-0__temporal-sub-0.mp4
+50,25.0,512,512,133.3,2.636,3.838,23.826,228.9,129.8,49.9,distilled 8 steps,text-original__ckpt-distilled__q-none__compile-0__offload-none__vae-tiling-0__fast-steps-1__lowres-0__temporal-sub-0.mp4
+50,25.0,512,512,132.8,2.691,4.118,24.541,210.3,129.4,49.3,distilled INT8,text-original__ckpt-distilled__q-int8__compile-0__offload-none__vae-tiling-0__fast-steps-1__lowres-0__temporal-sub-0.mp4
+50,25.0,512,512,142.3,2.71,3.704,23.122,244.0,131.5,51.1,distilled FP8 ckpt,text-original__ckpt-distilled_fp8__q-none__compile-0__offload-none__vae-tiling-0__fast-steps-1__lowres-0__temporal-sub-0.mp4
+50,25.0,512,512,110.4,3.014,5.075,35.125,67.4,134.4,51.8,lowres 384->512,text-original__ckpt-base__q-none__compile-0__offload-none__vae-tiling-0__fast-steps-0__lowres-1__temporal-sub-0.mp4
+50,25.0,512,512,136.7,1.57,2.53,16.181,258.2,133.3,50.8,temporal sub 9->25,text-original__ckpt-base__q-none__compile-0__offload-none__vae-tiling-0__fast-steps-0__lowres-0__temporal-sub-1.mp4
+50,25.0,512,512,88.4,1.267,1.702,20.922,75.3,133.1,50.0,lowres + temporal,text-original__ckpt-base__q-none__compile-0__offload-none__vae-tiling-0__fast-steps-0__lowres-1__temporal-sub-1.mp4
+50,25.0,512,512,87.6,1.352,2.341,12.375,145.1,135.0,51.8,saved embeds distilled,text-saved_embeds__ckpt-distilled__q-none__compile-0__offload-none__vae-tiling-0__fast-steps-1__lowres-0__temporal-sub-0.mp4
